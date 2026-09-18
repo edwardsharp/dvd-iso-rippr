@@ -1,0 +1,20 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+.coverage
+htmlcov/
+.DS_Store
+.build/
+.tools/
+# disc images and generated media do not belong in source control.
+*.iso
+*.ISO
+*.img
+*.IMG
+*.mp4
+.dvd-ripper-*/

@@ -1,0 +1,26 @@
+name: testz
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: fresh-install bootstrap
+        run: python scripts/setup.py --dev
+      - name: lint
+        run: .venv/bin/python -m ruff check .
+      - name: check formatting
+        run: .venv/bin/python -m ruff format --check .
+      - name: testz
+        run: .venv/bin/python -m pytest -q
