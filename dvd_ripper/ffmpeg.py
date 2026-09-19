@@ -13,6 +13,10 @@ class FFmpegError(RuntimeError):
     """a tool or media operation failed; safe to display to the user."""
 
 
+class FFmpegUnavailableError(FFmpegError):
+    """a tool could not be started; retrying other titles will not help."""
+
+
 async def stop_process(process: asyncio.subprocess.Process) -> None:
     """reap a child after cancellation, escalating if termination is ignored."""
     if process.returncode is None:
@@ -39,8 +43,8 @@ async def run_capture(args: list[str], *, timeout: float = 30) -> str:
             stderr=asyncio.subprocess.PIPE,
         )
     except OSError as exc:
-        raise FFmpegError(
-            f"could not run {args[0]!r}: {exc}. check its installation and PATH."
+        raise FFmpegUnavailableError(
+            f"could not run {args[0]!r}: {exc}. check its installation and path."
         ) from exc
     # keep draining pipes during termination; an undrained pipe can prevent wait() completing.
     communicate = asyncio.create_task(process.communicate())

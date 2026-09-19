@@ -11,7 +11,7 @@ from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import NoReturn
 
-from .ffmpeg import FFmpegError, run_capture
+from .ffmpeg import FFmpegError, FFmpegUnavailableError, run_capture
 from .models import DVD, Stream, Title
 
 MAX_DVD_TITLES = 99
@@ -171,7 +171,8 @@ async def probe_dvd_title(path: Path, number: int, *, ffprobe: str = "ffprobe") 
     then None. zero is valid. malformed, negative, and non-finite durations fail
     rather than being silently replaced. a title without video is returned for
     scan_dvd to report and skip. ffmpeg failures and malformed json raise
-    FFmpegError with path/title context; cancellation propagates to run_capture.
+    ffmpeg errors with path/title context, preserving unavailable-tool errors;
+    cancellation propagates to run_capture.
     """
     if type(number) is not int or not 1 <= number <= MAX_DVD_TITLES:
         raise ValueError("dvd title number must be an integer between 1 and 99.")
@@ -197,6 +198,8 @@ async def probe_dvd_title(path: Path, number: int, *, ffprobe: str = "ffprobe") 
         output = await run_capture(args, timeout=TITLE_PROBE_TIMEOUT)
     except FFmpegError as exc:
         message = f"could not probe title {number} of '{path}':\n{exc}"
+        if isinstance(exc, FFmpegUnavailableError):
+            raise FFmpegUnavailableError(message) from exc
         if any(int(match[1]) == number for match in _TITLE_NOT_FOUND.finditer(str(exc))):
             raise _TitleNotFound(message) from exc
         raise FFmpegError(message) from exc
@@ -215,9 +218,9 @@ async def scan_dvd(
     """scan title ids 1..99 sequentially, returning only titles with video.
 
     only the verified dvdvideo 'Title N not found' diagnostic ends the scan
-    early. any other failure aborts without returning partial results, including
-    on an empty/padding title. successful json without video is skipped with a
-    dvd warning (also sent to on_progress). no video titles is an error. each
+    early. unreadable titles and successful json without video are skipped with
+    a dvd warning (also sent to on_progress). unavailable tools and cancellation
+    abort the scan. no video titles is an error, including all skip reasons. each
     probe has a 180-second timeout; preindexing can make a full scan lengthy.
     """
     path = Path(path).expanduser().resolve()
@@ -228,24 +231,24 @@ async def scan_dvd(
             on_progress(f"scanning title {number} of '{path.name}' (preindexing)…")
         try:
             title = await probe_dvd_title(path, number, ffprobe=ffprobe)
-        except _TitleNotFound as exc:
-            if number == 1:
-                raise FFmpegError(f"no dvd titles found in '{path}':\n{exc}") from exc
+        except _TitleNotFound:
             break
+        except FFmpegUnavailableError:
+            raise
         except FFmpegError as exc:
-            raise FFmpegError(
-                f"dvd scan failed at title {number}; no partial results returned. "
-                "this failure does not confirm end-of-disc: expected the dvdvideo "
-                f"diagnostic 'Title {number} not found'. check the probe error below:\n{exc}"
-            ) from exc
-        if not any(stream.codec_type == "video" for stream in title.streams):
+            warning = f"skipped title {number}: {exc}"
+        else:
+            if any(stream.codec_type == "video" for stream in title.streams):
+                titles.append(title)
+                continue
             warning = f"skipped title {number}: no video stream was reported by ffprobe."
-            warnings.append(warning)
-            if on_progress is not None:
-                on_progress(warning)
-            continue
-        titles.append(title)
+        warnings.append(warning)
+        if on_progress is not None:
+            on_progress(warning)
     if not titles:
         details = "\n".join(warnings)
-        raise FFmpegError(f"no video titles found in '{path}'.\n{details}")
+        raise FFmpegError(
+            f"no video titles found in '{path}'. check that the image is a readable "
+            f"dvd-video disc and review any skipped-title errors below.\n{details}"
+        )
     return DVD(path=path, titles=tuple(titles), warnings=tuple(warnings))

@@ -7,12 +7,14 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 from rich.text import Text
-from textual.widgets import Button, Checkbox, Input, ProgressBar, RichLog, Select, Static
+from textual.geometry import Offset
+from textual.selection import Selection
+from textual.widgets import Button, Checkbox, Input, Log, ProgressBar, Select, Static
 
 import dvd_ripper.app as app_module
 from dvd_ripper.app import SILENT, DVDRipperApp
 from dvd_ripper.encoder import Progress, output_path
-from dvd_ripper.ffmpeg import FFmpegError, build_encode_command
+from dvd_ripper.ffmpeg import FFmpegError, FFmpegUnavailableError, build_encode_command
 from dvd_ripper.models import DVD, EncodeSettings, Stream, Title
 
 pytestmark = pytest.mark.asyncio
@@ -115,12 +117,11 @@ def status(app):
 
 
 def log_text(app, selector="#log"):
-    return "\n".join(line.text for line in app.query_one(selector, RichLog).lines)
+    return "\n".join(app.query_one(selector, Log).lines)
 
 
 def assert_logged(app, message):
-    # wrapping can split paths or consume spaces at word boundaries.
-    assert "".join(message.split()) in "".join(log_text(app).split())
+    assert message in log_text(app)
 
 
 def assert_error(app, message):
@@ -135,6 +136,7 @@ def assert_commands_cleared(app):
     preview = log_text(app, "#preview")
     assert "command display is optional" in preview
     assert "-map" not in preview
+    assert not list(app.query("#copy-command, #copy-log"))
 
 
 def assert_action(app, label="encode", *, disabled=False):
@@ -284,9 +286,9 @@ async def test_preview_is_shell_quoted_literal_and_never_encodes(backend, tmp_pa
     app = DVDRipperApp([dvd.path], output_dir=output_dir, ffmpeg="custom ffmpeg")
     async with app.run_test(size=(100, 40)) as pilot:
         await idle(app, pilot)
-        preview = app.query_one("#preview", RichLog)
-        write = Mock(wraps=preview.write)
-        monkeypatch.setattr(preview, "write", write)
+        preview = app.query_one("#preview", Log)
+        write = Mock(wraps=preview.write_line)
+        monkeypatch.setattr(preview, "write_line", write)
         await click(app, pilot, "#preview-button")
         encode.assert_not_awaited()
         assert_action(app)
@@ -302,17 +304,139 @@ async def test_preview_is_shell_quoted_literal_and_never_encodes(backend, tmp_pa
             ffmpeg="custom ffmpeg",
         )
         rendered = write.call_args.args[0]
-        assert isinstance(rendered, Text)
-        assert rendered.plain == shlex.join(command)
-        assert shlex.split(rendered.plain) == command
-        assert "[red]" in rendered.plain
-        assert not rendered.spans
+        assert isinstance(rendered, str)
+        assert rendered == shlex.join(command)
+        assert shlex.split(rendered) == command
+        assert "[red]" in rendered
         assert build.call_args.args == (dvd.path, title, output)
         assert build.call_args.kwargs["ffmpeg"] == "custom ffmpeg"
         assert "-sn" in command and "-dn" in command
         assert "-c:s" not in command
         assert command_maps(command) == ["0:0", "0:2"]
         assert not output_dir.exists()
+
+
+@pytest.mark.parametrize("selector", ["#preview", "#log"])
+async def test_scrolled_log_selection_copies_partial_text_without_quitting(
+    backend, monkeypatch, selector
+):
+    dvd, _, _, _ = backend
+    app = DVDRipperApp([dvd.path], output_dir=dvd.path.parent)
+    copy = Mock(wraps=app.copy_to_clipboard)
+    monkeypatch.setattr(app, "copy_to_clipboard", copy)
+    async with app.run_test(size=(100, 40)) as pilot:
+        await idle(app, pilot)
+        log = app.query_one(selector, Log)
+        lines = [
+            f"line {index}: [bold]café's quoted text[/bold] " + "x" * 200 for index in range(15)
+        ]
+        log.clear().write_lines(lines)
+        log.scroll_visible(animate=False)
+        log.focus()
+        await pilot.pause()
+        log.scroll_to(x=8, y=5, animate=False, immediate=True)
+        await pilot.pause()
+        assert log.scroll_offset == Offset(8, 5)
+        strip = log.render_line(1)
+        assert next(iter(strip)).style.meta["offset"] == (8, 6)
+        assert strip.text.startswith(lines[6][8:20])
+        selection = Selection.from_offsets(Offset(12, 6), Offset(27, 7))
+        expected = lines[6][12:] + "\n" + lines[7][:27]
+        assert log.get_selection(selection) == (expected, "\n")
+        app.screen.selections = {log: selection}
+        await pilot.pause()
+        assert app.screen.get_selected_text() == expected
+        await pilot.press("ctrl+c")
+        copy.assert_called_once_with(expected)
+        assert app.clipboard == expected
+        assert app.is_running
+        assert not app._ripper_closing
+        assert_action(app)
+
+
+async def test_ctrl_c_keeps_input_copy_binding(backend, monkeypatch):
+    dvd, _, _, _ = backend
+    app = DVDRipperApp([dvd.path], output_dir=dvd.path.parent)
+    copy = Mock(wraps=app.copy_to_clipboard)
+    monkeypatch.setattr(app, "copy_to_clipboard", copy)
+    async with app.run_test(size=(100, 40)) as pilot:
+        await idle(app, pilot)
+        field = app.query_one("#output-directory", Input)
+        field.scroll_visible(animate=False)
+        field.focus()
+        await pilot.pause()
+        await pilot.press("home", "shift+end", "ctrl+c")
+        copy.assert_called_once_with(field.value)
+        assert app.is_running
+        assert not app._ripper_closing
+
+
+async def test_command_selection_is_complete_literal_multiline_and_invalidates(
+    backend, monkeypatch
+):
+    dvd, _, encode, build = backend
+    app = DVDRipperApp(
+        [dvd.path], output_dir=dvd.path.parent, ffmpeg="café's [red]tools/" + "x" * 160
+    )
+    copy = Mock(wraps=app.copy_to_clipboard)
+    monkeypatch.setattr(app, "copy_to_clipboard", copy)
+    async with app.run_test() as pilot:
+        await idle(app, pilot)
+        await click(app, pilot, "#all")
+        await click(app, pilot, "#preview-button")
+        commands = [
+            build_encode_command(*call.args, **call.kwargs) for call in build.call_args_list
+        ]
+        expected = "\n".join(shlex.join(command) for command in commands)
+        assert len(commands) == 3
+        preview = app.query_one("#preview", Log)
+        assert preview.lines[1:] == expected.splitlines()
+        assert all(len(line) > preview.size.width for line in preview.lines[1:])
+        preview.focus()
+        app.screen.selections = {
+            preview: Selection.from_offsets(
+                Offset(0, 1), Offset(len(preview.lines[-1]), len(preview.lines) - 1)
+            )
+        }
+        await pilot.press("ctrl+c")
+        copy.assert_called_once_with(expected)
+        assert app.clipboard == expected
+        assert "filenames shown are estimates" not in expected
+        assert "café" in expected and "[red]" in expected
+        assert [shlex.split(line) for line in expected.splitlines()] == commands
+        app.screen.selections = {}
+        app.query_one("#output-directory", Input).value += " changed"
+        await pilot.pause()
+        assert_commands_cleared(app)
+        assert not list(app.query("#copy-command, #copy-log"))
+        assert copy.call_count == 1
+        encode.assert_not_awaited()
+
+
+async def test_log_selection_preserves_full_bounded_lines(backend, monkeypatch):
+    dvd, _, _, _ = backend
+    app = DVDRipperApp([dvd.path], output_dir=dvd.path.parent)
+    copy = Mock(wraps=app.copy_to_clipboard)
+    monkeypatch.setattr(app, "copy_to_clipboard", copy)
+    async with app.run_test() as pilot:
+        await idle(app, pilot)
+        log = app.query_one("#log", Log).clear()
+        lines = [f"line {index}: café's [bold]literal[/bold] " + "x" * 180 for index in range(505)]
+        app._write_log("\n".join(lines))
+        await pilot.pause()
+        assert log.max_lines == 500
+        assert log.lines == lines[-500:]
+        log.focus()
+        app.screen.selections = {
+            log: Selection.from_offsets(
+                Offset(0, 0), Offset(len(log.lines[-1]), len(log.lines) - 1)
+            )
+        }
+        await pilot.press("ctrl+c")
+        expected = "\n".join(lines[-500:])
+        copy.assert_called_once_with(expected)
+        assert app.clipboard == expected
+        assert log.lines == lines[-500:]
 
 
 async def test_encode_uses_live_titles_audio_and_settings_without_reshowing_commands(backend):
@@ -612,19 +736,19 @@ async def test_collision_preview_is_estimate_backend_receives_base_and_actual_pa
     app = DVDRipperApp([dvd.path], output_dir=tmp_path)
     async with app.run_test(size=(100, 40)) as pilot:
         await idle(app, pilot)
-        preview = app.query_one("#preview", RichLog)
-        write = Mock(wraps=preview.write)
-        monkeypatch.setattr(preview, "write", write)
+        preview = app.query_one("#preview", Log)
+        write = Mock(wraps=preview.write_line)
+        monkeypatch.setattr(preview, "write_line", write)
         await click(app, pilot, "#preview-button")
         assert build.call_args.args[2] == estimate
-        assert shlex.split(write.call_args.args[0].plain)[-1] == str(estimate)
+        assert shlex.split(write.call_args.args[0])[-1] == str(estimate)
         assert "filenames shown are estimates" in log_text(app, "#preview")
         available.assert_called_with(base)
         assert not estimate.exists()
         encode.assert_not_awaited()
-        log = app.query_one("#log", RichLog)
-        log_write = Mock(wraps=log.write)
-        monkeypatch.setattr(log, "write", log_write)
+        log = app.query_one("#log", Log)
+        log_write = Mock(wraps=log.write_line)
+        monkeypatch.setattr(log, "write_line", log_write)
         await click(app, pilot, "#encode")
         await idle(app, pilot)
         encode.assert_awaited_once()
@@ -635,7 +759,7 @@ async def test_collision_preview_is_estimate_backend_receives_base_and_actual_pa
             assert call.args == (dvd.path, title, tmp_path)
             assert call.kwargs == {"unique": False}
         assert_logged(app, f"completed: {published}")
-        messages = [call.args[0].plain for call in log_write.call_args_list]
+        messages = [call.args[0] for call in log_write.call_args_list]
         assert f"completed: {published}" in messages
         assert f"completed: {estimate}" not in messages
         assert base.read_bytes() == b"existing output"
@@ -643,10 +767,53 @@ async def test_collision_preview_is_estimate_backend_receives_base_and_actual_pa
         assert "completed 1 title(s)" in status(app)
 
 
-async def test_scan_failure_is_full_literal_error_then_button_retry(backend):
+async def test_partial_scan_reports_warning_once_and_encodes_only_readable_titles(backend):
+    dvd, scan, encode, _ = backend
+    readable = Title(4, 600, dvd.titles[1].streams)
+    warning = "skipped title 2: ffprobe failed\n[red]unreadable café's title[/red]\nlast detail"
+    result = DVD(dvd.path, (dvd.titles[0], readable), (warning,))
+    reported = asyncio.Event()
+    release = asyncio.Event()
+
+    async def partial_scan(path, **kwargs):
+        kwargs["on_progress"](warning)
+        reported.set()
+        await release.wait()
+        return result
+
+    scan.side_effect = partial_scan
+    app = DVDRipperApp([dvd.path], output_dir=dvd.path.parent)
+    async with app.run_test(size=(100, 40)) as pilot:
+        try:
+            await asyncio.wait_for(reported.wait(), 3)
+            await pilot.pause()
+            assert status(app) == warning.splitlines()[0]
+            assert_logged(app, warning)
+            assert not app.query_one("#error", Static).display
+        finally:
+            release.set()
+        await idle(app, pilot)
+        assert app._dvd is result
+        assert not list(app.query("#title-2"))
+        assert selected(app) == [4]
+        assert app.query_one("#audio-4", Select).value == 2
+        assert "found 2 title(s); skipped 1 title(s)." in status(app)
+        assert_logged(app, "scan complete: 2 title(s); skipped 1 title(s).")
+        assert log_text(app).count(warning) == 1
+        assert not app.query_one("#error", Static).display
+        assert_action(app)
+        await click(app, pilot, "#all")
+        await click(app, pilot, "#encode")
+        await idle(app, pilot)
+        assert [call.args[1].number for call in encode.call_args_list] == [1, 4]
+        assert [call.kwargs["audio_index"] for call in encode.call_args_list] == [1, 2]
+
+
+@pytest.mark.parametrize("error_type", [FFmpegError, FFmpegUnavailableError])
+async def test_scan_failure_is_full_literal_error_then_button_retry(backend, error_type):
     dvd, scan, encode, _ = backend
     detail = "cannot read [red]disc[/red]\nffprobe details: [bold]unreadable title[/bold]"
-    scan.side_effect = [FFmpegError(detail), dvd]
+    scan.side_effect = [error_type(detail), dvd]
     app = DVDRipperApp([dvd.path], output_dir=dvd.path.parent)
     async with app.run_test(size=(100, 40)) as pilot:
         await idle(app, pilot)
@@ -741,7 +908,7 @@ async def test_scan_responsive_cancel_cleanup_and_late_callback(backend):
         assert_action(app)
 
 
-async def test_encode_batch_progress_and_busy_controls(backend, tmp_path):
+async def test_encode_batch_progress_and_busy_controls(backend, tmp_path, monkeypatch):
     dvd, _, encode, _ = backend
     started = asyncio.Event()
     release = asyncio.Event()
@@ -756,6 +923,9 @@ async def test_encode_batch_progress_and_busy_controls(backend, tmp_path):
 
     encode.side_effect = slow_encode
     app = DVDRipperApp([dvd.path], output_dir=tmp_path, ffmpeg="chosen-ffmpeg")
+    copy = Mock(wraps=app.copy_to_clipboard)
+    monkeypatch.setattr(app, "copy_to_clipboard", copy)
+    monkeypatch.setattr(app, "notify", Mock())
     async with app.run_test(size=(100, 40)) as pilot:
         try:
             await idle(app, pilot)
@@ -775,6 +945,37 @@ async def test_encode_batch_progress_and_busy_controls(backend, tmp_path):
             assert_action(app, "cancel encoding")
             await click(app, pilot, "#all")
             await click(app, pilot, "#use-output")
+            assert encode.await_count == 1
+            task = app._job
+            before = status(app), progress.progress, log_text(app), log_text(app, "#preview")
+            commands = "\n".join(app.query_one("#preview", Log).lines[1:])
+            assert commands.count("chosen-ffmpeg") == 3
+            assert not app.screen.selections
+            for selector in ("#preview", "#log"):
+                log = app.query_one(selector, Log)
+                log.focus()
+                first = 1 if selector == "#preview" else 0
+                expected = "\n".join(log.lines[first:])
+                app.screen.selections = {
+                    log: Selection.from_offsets(
+                        Offset(0, first), Offset(len(log.lines[-1]), len(log.lines) - 1)
+                    )
+                }
+                await pilot.press("ctrl+c")
+                copy.assert_called_with(expected)
+                assert app.clipboard == expected
+                assert app._job is task
+                assert task.cancelling() == 0 and not task.done()
+                assert not app._cancelling
+                assert_action(app, "cancel encoding")
+                assert_busy_controls(app)
+                assert before == (
+                    status(app),
+                    progress.progress,
+                    log_text(app),
+                    log_text(app, "#preview"),
+                )
+            assert copy.call_count == 2
             assert encode.await_count == 1
         finally:
             release.set()
@@ -860,8 +1061,11 @@ async def test_main_encode_action_cancels_once_stops_queue_and_keeps_completed_l
         assert (status(app), app.query_one("#progress", ProgressBar).progress) == before
 
 
+@pytest.mark.parametrize("quit_key", ["q", "ctrl+q"])
 @pytest.mark.parametrize("job_name", ["scan", "encode"])
-async def test_quit_waits_for_backend_cleanup_and_ignores_late_callbacks(backend, job_name):
+async def test_quit_waits_for_backend_cleanup_and_ignores_late_callbacks(
+    backend, job_name, quit_key
+):
     dvd, scan, encode, _ = backend
     started = asyncio.Event()
     cleaning = asyncio.Event()
@@ -892,7 +1096,7 @@ async def test_quit_waits_for_backend_cleanup_and_ignores_late_callbacks(backend
             await asyncio.wait_for(started.wait(), 3)
             task = app._job
             # do not await the key dispatch until the deliberately held cleanup can finish.
-            quitting = asyncio.create_task(pilot.press("q"))
+            quitting = asyncio.create_task(pilot.press(quit_key))
             await asyncio.wait_for(cleaning.wait(), 3)
             assert not cleaned.is_set()
             assert app._job is task
@@ -986,6 +1190,7 @@ async def test_default_80_by_24_layout_keeps_actions_separate_and_reachable(back
         await click(app, pilot, "#preview-button")
         assert app.screen.region.contains_region(command.region)
         assert not command.region.overlaps(action.region)
+        assert not list(app.query("#copy-command, #copy-log"))
         field = app.query_one("#output-directory", Input)
         use_output = app.query_one("#use-output", Button)
         field.scroll_visible(animate=False)

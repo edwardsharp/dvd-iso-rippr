@@ -9,7 +9,13 @@ from unittest.mock import AsyncMock
 import pytest
 
 from dvd_ripper import ffmpeg
-from dvd_ripper.ffmpeg import FFmpegError, build_encode_command, choose_english_audio, run_capture
+from dvd_ripper.ffmpeg import (
+    FFmpegError,
+    FFmpegUnavailableError,
+    build_encode_command,
+    choose_english_audio,
+    run_capture,
+)
 from dvd_ripper.models import EncodeSettings, Stream, Title
 
 
@@ -331,6 +337,7 @@ async def test_run_capture_nonzero_reports_exit_command_and_stderr(stderr):
     script = f"import sys; sys.stdout.write('not success'); sys.stderr.buffer.write({stderr!r}); sys.exit(7)"
     with pytest.raises(FFmpegError) as error:
         await asyncio.wait_for(run_capture([sys.executable, "-c", script]), 10)
+    assert not isinstance(error.value, FFmpegUnavailableError)
     message = str(error.value)
     assert "exit 7" in message
     assert sys.executable in message
@@ -340,12 +347,40 @@ async def test_run_capture_nonzero_reports_exit_command_and_stderr(stderr):
 @pytest.mark.asyncio
 async def test_run_capture_missing_executable_has_actionable_error(tmp_path):
     missing = str(tmp_path / "missing executable")
-    with pytest.raises(FFmpegError) as error:
+    with pytest.raises(FFmpegUnavailableError) as error:
         await run_capture([missing])
     assert "could not run" in str(error.value)
     assert "missing executable" in str(error.value)
-    assert "installation and PATH" in str(error.value)
+    assert "installation and path" in str(error.value)
     assert isinstance(error.value.__cause__, OSError)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    [
+        FileNotFoundError("missing executable"),
+        PermissionError("permission denied"),
+        OSError("process limit reached"),
+    ],
+)
+async def test_run_capture_spawn_oserror_is_unavailable(monkeypatch, failure):
+    create = AsyncMock(side_effect=failure)
+    monkeypatch.setattr(ffmpeg.asyncio, "create_subprocess_exec", create)
+    with pytest.raises(FFmpegUnavailableError) as error:
+        await run_capture(["ffprobe", "-version"])
+    assert isinstance(error.value, FFmpegError)
+    assert str(error.value) == (
+        f"could not run 'ffprobe': {failure}. check its installation and path."
+    )
+    assert error.value.__cause__ is failure
+    create.assert_awaited_once_with(
+        "ffprobe",
+        "-version",
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
 
 
 @pytest.mark.asyncio
@@ -355,6 +390,7 @@ async def test_run_capture_timeout_terminates_and_reaps_real_child(captured_proc
         await asyncio.wait_for(
             run_capture([sys.executable, "-c", "import time; time.sleep(60)"], timeout=0.1), 10
         )
+    assert not isinstance(error.value, FFmpegUnavailableError)
     assert isinstance(error.value.__cause__, TimeoutError)
     assert len(processes) == 1
     assert processes[0].returncode is not None

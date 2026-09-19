@@ -41,7 +41,9 @@ choose a disc → confirm output → select titles/audio → **encode**. without
 
 **main/all** select titles. **show ffmpeg command** is optional. the bottom **encode** button becomes **cancel encoding** (or **cancel scan**) while working. cancelling stops the batch, removes unfinished output, and keeps completed files. **q** quits.
 
-the longest title is selected by default; review it. audio defaults to english, then the first available track, or silent if none exist. stereo AAC is the default. subtitles/OCR and decryption are not implemented.
+unreadable titles are skipped and logged; readable titles before and after them remain selectable. a scan only fails if no usable titles remain or the probe tool cannot start.
+
+the longest readable title is selected by default; review it. audio defaults to english, then the first available track, or silent if none exist. stereo AAC is the default. subtitles/OCR and decryption are not implemented.
 
 outputs: `movies/movie/movie - Title 1.mp4`, then `movie - Title 1 (1).mp4`, `(2)`, etc. existing paths are never replaced, even if another job creates a file during encoding. the log shows the final filename; errors appear in a separate panel.
 

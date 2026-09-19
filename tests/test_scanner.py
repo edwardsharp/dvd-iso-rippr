@@ -10,7 +10,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
-from dvd_ripper.ffmpeg import FFmpegError
+from dvd_ripper.ffmpeg import FFmpegError, FFmpegUnavailableError
 from dvd_ripper.models import DVD, Stream, Title
 from dvd_ripper.scanner import find_isos, probe_dvd_title, scan_dvd
 
@@ -380,6 +380,21 @@ class ProbeTitleTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(str(failure), str(caught.exception))
         self.assertIs(caught.exception.__cause__, failure)
 
+    async def test_unavailable_tool_preserves_subtype_context_and_cause(self) -> None:
+        for diagnostic in ("could not run ffprobe: permission denied", "Title 4 not found"):
+            with self.subTest(diagnostic=diagnostic):
+                self.capture.reset_mock()
+                failure = FFmpegUnavailableError(diagnostic)
+                self.capture.side_effect = failure
+                with self.assertRaises(FFmpegUnavailableError) as caught:
+                    await probe_dvd_title(self.path, 4)
+                self.assertEqual(
+                    str(caught.exception),
+                    f"could not probe title 4 of '{self.path.resolve()}':\n{diagnostic}",
+                )
+                self.assertIs(caught.exception.__cause__, failure)
+                self.capture.assert_awaited_once()
+
 
 class ScanDvdTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
@@ -417,7 +432,7 @@ class ScanDvdTests(unittest.IsolatedAsyncioTestCase):
                 self.capture.side_effect = [self.payload, FFmpegError(diagnostic)]
                 self.assertEqual(len((await scan_dvd(self.path)).titles), 1)
 
-    async def test_all_other_errors_abort_including_after_successful_titles(self) -> None:
+    async def test_other_probe_errors_are_skipped_before_and_after_successful_titles(self) -> None:
         diagnostics = (
             "Unknown input format: dvdvideo",
             "Could not find executable: ffprobe",
@@ -442,14 +457,103 @@ class ScanDvdTests(unittest.IsolatedAsyncioTestCase):
                 with self.subTest(successful_count=successful_count, diagnostic=diagnostic):
                     self.capture.reset_mock()
                     self.capture.side_effect = [self.payload] * successful_count + [
-                        FFmpegError(diagnostic)
+                        FFmpegError(diagnostic),
+                        self.payload,
+                        end_of_disc(successful_count + 3),
                     ]
-                    with self.assertRaises(FFmpegError) as caught:
-                        await scan_dvd(self.path)
-                    self.assertIn(diagnostic, str(caught.exception))
-                    self.assertIn(f"title {successful_count + 1}", str(caught.exception))
-                    self.assertIn("does not confirm end-of-disc", str(caught.exception))
-                    self.assertEqual(self.capture.await_count, successful_count + 1)
+                    progress: list[str] = []
+                    dvd = await scan_dvd(self.path, on_progress=progress.append)
+                    self.assertEqual(
+                        [title.number for title in dvd.titles],
+                        list(range(1, successful_count + 1)) + [successful_count + 2],
+                    )
+                    self.assertEqual(len(dvd.warnings), 1)
+                    warning = dvd.warnings[0]
+                    self.assertIn(f"skipped title {successful_count + 1}", warning)
+                    self.assertEqual(warning.count(diagnostic), 1)
+                    self.assertEqual(progress.count(warning), 1)
+                    self.assertNotIn("scan failed", warning)
+                    self.assertNotIn("no partial results", warning)
+                    self.assertEqual(self.capture.await_count, successful_count + 3)
+
+    async def test_heathers_padding_title_preserves_earlier_and_later_titles(self) -> None:
+        self.path = Path("heathers.iso")
+        diagnostic = (
+            "[dvdvideo @ 0x1234abcd] Title 3, PGC 3 looks empty (may consist of padding cells), "
+            "if you want to try anyway, disable the -trim option\n"
+            "heathers.iso: Invalid data found when processing input"
+        )
+        self.capture.side_effect = [
+            self.payload,
+            self.payload,
+            FFmpegError(diagnostic),
+            self.payload,
+            end_of_disc(5),
+        ]
+        progress: list[str] = []
+        dvd = await scan_dvd(self.path, on_progress=progress.append)
+        self.assertEqual([title.number for title in dvd.titles], [1, 2, 4])
+        warning = (
+            f"skipped title 3: could not probe title 3 of '{self.path.resolve()}':\n{diagnostic}"
+        )
+        self.assertEqual(dvd.warnings, (warning,))
+        self.assertEqual(progress.count(warning), 1)
+        self.assertEqual("\n".join(progress).count(diagnostic), 1)
+        self.assertEqual(len(progress), 6)
+        self.assertLess(progress.index(warning), len(progress) - 2)
+        self.assertEqual(self.capture.await_count, 5)
+        for number, call in enumerate(self.capture.await_args_list, 1):
+            args = call.args[0]
+            self.assertEqual(args[args.index("-title") + 1], str(number))
+            self.assertNotIn("-trim", args)
+            self.assertEqual(call.kwargs, {"timeout": 180.0})
+
+    async def test_multiple_unreadable_titles_each_warn_and_preserve_order(self) -> None:
+        diagnostics = (
+            "Unable to read next block of PGC",
+            "Invalid data found when processing input",
+        )
+        self.capture.side_effect = [
+            self.payload,
+            *(FFmpegError(diagnostic) for diagnostic in diagnostics),
+            self.payload,
+            end_of_disc(5),
+        ]
+        progress: list[str] = []
+        dvd = await scan_dvd(self.path, on_progress=progress.append)
+        self.assertEqual([title.number for title in dvd.titles], [1, 4])
+        self.assertEqual(len(dvd.warnings), 2)
+        for number, (warning, diagnostic) in enumerate(zip(dvd.warnings, diagnostics), 2):
+            self.assertTrue(warning.startswith(f"skipped title {number}:"))
+            self.assertEqual(warning.count(diagnostic), 1)
+            self.assertEqual("\n".join(progress).count(diagnostic), 1)
+        self.assertEqual(
+            [message for message in progress if message.startswith("skipped")], list(dvd.warnings)
+        )
+        self.assertEqual(self.capture.await_count, 5)
+
+    async def test_unavailable_tool_aborts_even_after_successful_titles(self) -> None:
+        for successful_count in (0, 2):
+            with self.subTest(successful_count=successful_count):
+                self.capture.reset_mock()
+                failure = FFmpegUnavailableError("could not run ffprobe: permission denied")
+                self.capture.side_effect = [self.payload] * successful_count + [
+                    failure,
+                    self.payload,
+                    end_of_disc(successful_count + 3),
+                ]
+                progress: list[str] = []
+                with self.assertRaises(FFmpegUnavailableError) as caught:
+                    await scan_dvd(self.path, on_progress=progress.append)
+                self.assertEqual(
+                    str(caught.exception),
+                    f"could not probe title {successful_count + 1} of '{self.path.resolve()}':\n"
+                    f"{failure}",
+                )
+                self.assertIs(caught.exception.__cause__, failure)
+                self.assertEqual(len(progress), successful_count + 1)
+                self.assertTrue(all(message.startswith("scanning") for message in progress))
+                self.assertEqual(self.capture.await_count, successful_count + 1)
 
     async def test_similar_diagnostics_wrong_title_and_filenames_are_not_boundaries(self) -> None:
         diagnostics = (
@@ -462,14 +566,25 @@ class ScanDvdTests(unittest.IsolatedAsyncioTestCase):
         )
         for diagnostic in diagnostics:
             with self.subTest(diagnostic=diagnostic):
-                self.capture.side_effect = [self.payload, FFmpegError(diagnostic)]
-                with self.assertRaisesRegex(FFmpegError, "does not confirm end-of-disc"):
-                    await scan_dvd(self.path)
+                self.capture.reset_mock()
+                self.capture.side_effect = [
+                    self.payload,
+                    FFmpegError(diagnostic),
+                    self.payload,
+                    end_of_disc(4),
+                ]
+                dvd = await scan_dvd(self.path)
+                self.assertEqual([title.number for title in dvd.titles], [1, 3])
+                self.assertEqual(len(dvd.warnings), 1)
+                self.assertIn("skipped title 2", dvd.warnings[0])
+                self.assertEqual(dvd.warnings[0].count(diagnostic), 1)
+                self.assertEqual(self.capture.await_count, 4)
 
     async def test_boundary_at_first_title_is_not_an_empty_success(self) -> None:
-        self.capture.side_effect = end_of_disc(1)
-        with self.assertRaisesRegex(FFmpegError, "no dvd titles found"):
+        self.capture.side_effect = [end_of_disc(1)]
+        with self.assertRaisesRegex(FFmpegError, "no video titles found") as caught:
             await scan_dvd(self.path)
+        self.assertIn("check that the image is a readable dvd-video disc", str(caught.exception))
         self.capture.assert_awaited_once()
 
     async def test_no_video_titles_are_skipped_with_visible_warnings(self) -> None:
@@ -508,12 +623,59 @@ class ScanDvdTests(unittest.IsolatedAsyncioTestCase):
             await scan_dvd(self.path)
         self.assertIn("skipped title 1", str(caught.exception))
 
+    async def test_all_unusable_titles_report_actionable_error_and_each_skip_reason(self) -> None:
+        diagnostic = "[dvdvideo @ 0xabc] Title 1 has invalid headers in VTS"
+        self.capture.side_effect = [
+            FFmpegError(diagnostic),
+            "not json",
+            '{"streams": []}',
+            FFmpegError("timed out after 180s: ffprobe"),
+            end_of_disc(5),
+        ]
+        progress: list[str] = []
+        with self.assertRaises(FFmpegError) as caught:
+            await scan_dvd(self.path, on_progress=progress.append)
+        message = str(caught.exception)
+        self.assertIn("no video titles found", message)
+        self.assertIn(str(self.path.resolve()), message)
+        self.assertIn("check that the image is a readable dvd-video disc", message)
+        self.assertIn("review any skipped-title errors", message)
+        self.assertEqual(message.count(diagnostic), 1)
+        self.assertIn("malformed ffprobe data for title 2", message)
+        self.assertIn("no video stream", message)
+        self.assertEqual(message.count("timed out after 180s: ffprobe"), 1)
+        self.assertNotIn("scan failed", message)
+        self.assertNotIn("no partial results", message)
+        warnings = [entry for entry in progress if entry.startswith("skipped")]
+        self.assertEqual(len(warnings), 4)
+        for number, warning in enumerate(warnings, 1):
+            self.assertTrue(warning.startswith(f"skipped title {number}:"))
+            self.assertEqual(message.count(warning), 1)
+            self.assertEqual(progress.count(warning), 1)
+        self.assertEqual(self.capture.await_count, 5)
+
     async def test_malformed_success_output_does_not_end_scan(self) -> None:
-        for output in ("{}", "not json", '{"error": "Title 2 not found"}'):
+        bad_duration = video_payload()
+        bad_duration["format"]["duration"] = "Title 2 not found"
+        bad_stream = video_payload()
+        bad_stream["streams"][0]["index"] = "Title 2 not found"
+        for output in (
+            "{}",
+            "not json",
+            '{"error": "Title 2 not found"}',
+            json.dumps(bad_duration),
+            json.dumps(bad_stream),
+        ):
             with self.subTest(output=output):
-                self.capture.side_effect = [self.payload, output]
-                with self.assertRaisesRegex(FFmpegError, "dvd scan failed at title 2"):
-                    await scan_dvd(self.path)
+                self.capture.reset_mock()
+                self.capture.side_effect = [self.payload, output, self.payload, end_of_disc(4)]
+                dvd = await scan_dvd(self.path)
+                self.assertEqual([title.number for title in dvd.titles], [1, 3])
+                self.assertEqual(len(dvd.warnings), 1)
+                self.assertIn(
+                    "skipped title 2: malformed ffprobe data for title 2", dvd.warnings[0]
+                )
+                self.assertEqual(self.capture.await_count, 4)
 
     async def test_scan_is_bounded_at_99_and_never_probes_100(self) -> None:
         self.capture.return_value = self.payload
@@ -523,11 +685,30 @@ class ScanDvdTests(unittest.IsolatedAsyncioTestCase):
         args = self.capture.await_args_list[-1].args[0]
         self.assertEqual(args[args.index("-title") + 1], "99")
 
-    async def test_cancellation_propagates_without_probing_further(self) -> None:
-        self.capture.side_effect = [self.payload, asyncio.CancelledError()]
-        with self.assertRaises(asyncio.CancelledError):
+    async def test_all_failed_probes_are_still_bounded_at_99(self) -> None:
+        self.capture.side_effect = [FFmpegError("unreadable title")] * 99
+        with self.assertRaisesRegex(FFmpegError, "no video titles found") as caught:
             await scan_dvd(self.path)
-        self.assertEqual(self.capture.await_count, 2)
+        message = str(caught.exception)
+        self.assertEqual(message.count("skipped title "), 99)
+        self.assertEqual(self.capture.await_count, 99)
+        args = self.capture.await_args_list[-1].args[0]
+        self.assertEqual(args[args.index("-title") + 1], "99")
+
+    async def test_cancellation_propagates_without_probing_further(self) -> None:
+        self.capture.side_effect = [
+            self.payload,
+            FFmpegError("unreadable title"),
+            asyncio.CancelledError(),
+            self.payload,
+            end_of_disc(5),
+        ]
+        progress: list[str] = []
+        with self.assertRaises(asyncio.CancelledError):
+            await scan_dvd(self.path, on_progress=progress.append)
+        self.assertEqual(self.capture.await_count, 3)
+        self.assertEqual(sum(message.startswith("skipped") for message in progress), 1)
+        self.assertTrue(progress[-1].startswith("scanning title 3"))
 
     async def test_cancelling_scan_cancels_the_inflight_capture(self) -> None:
         started = asyncio.Event()

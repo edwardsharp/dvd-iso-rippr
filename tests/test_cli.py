@@ -89,6 +89,7 @@ def test_help_works_without_python_or_tool_dependencies(flag, cli_backend, monke
         "--check",
         "--setup-ffmpeg",
         "--recursive",
+        "--no-mouse",
         "--output-dir",
         "--ffmpeg",
         "--ffprobe",
@@ -286,7 +287,7 @@ def test_directory_and_repeated_file_arguments_forward_deduplicated_images(
     cli_backend.app.assert_called_once_with(
         expected, output_dir=None, ffmpeg="ffmpeg", ffprobe="ffprobe"
     )
-    cli_backend.app.return_value.run.assert_called_once_with()
+    cli_backend.app.return_value.run.assert_called_once_with(mouse=True)
     cli_backend.check.assert_awaited_once_with(ffmpeg="ffmpeg", ffprobe="ffprobe")
 
 
@@ -317,12 +318,17 @@ def test_custom_tools_and_output_directory_propagate_to_app(
 
     cli_backend.check.assert_awaited_once_with(**tools)
     cli_backend.app.assert_called_once_with([image], output_dir=output, **tools)
-    cli_backend.app.return_value.run.assert_called_once_with()
+    cli_backend.app.return_value.run.assert_called_once_with(mouse=True)
     assert not output.exists()
 
 
+def test_no_mouse_leaves_terminal_selection_enabled(image, cli_backend):
+    assert cli.main([str(image), "--no-mouse"]) == 0
+    cli_backend.app.return_value.run.assert_called_once_with(mouse=False)
+
+
 @pytest.mark.parametrize("issues", [[], ["custom ffprobe: missing dvdvideo demuxer"]])
-def test_check_uses_custom_tools(issues, cli_backend, tmp_path, capsys):
+def test_check_uses_custom_tools(cli_backend, tmp_path, capsys, issues):
     tools = {"ffmpeg": str(tmp_path / "ffmpeg-dvd"), "ffprobe": str(tmp_path / "ffprobe-dvd")}
 
     cli_backend.check.return_value = issues
@@ -441,7 +447,7 @@ def test_conversion_passes_local_pair_to_dependency_check_and_app(image, local_t
 
     cli_backend.check.assert_awaited_once_with(**local_tools)
     cli_backend.app.assert_called_once_with([image], output_dir=None, **local_tools)
-    cli_backend.app.return_value.run.assert_called_once_with()
+    cli_backend.app.return_value.run.assert_called_once_with(mouse=True)
 
 
 @pytest.mark.parametrize("tool", ["ffmpeg", "ffprobe"])
@@ -803,7 +809,7 @@ def test_dependency_issues_missing_tools_are_actionable_and_both_are_checked(
     assert len(issues) == len(missing)
     for tool in missing:
         assert any(
-            f"could not run '{tool}'" in issue and "installation and PATH" in issue
+            f"could not run '{tool}'" in issue and "installation and path" in issue
             for issue in issues
         )
     demuxer_tools = {

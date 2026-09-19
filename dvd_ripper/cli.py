@@ -34,6 +34,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--recursive", action="store_true", help="include nested directories")
     parser.add_argument(
+        "--no-mouse",
+        action="store_true",
+        help="leave mouse selection to the terminal; navigate the app with the keyboard",
+    )
+    parser.add_argument(
         "--check", action="store_true", help="check Python and FFmpeg dependencies, then exit"
     )
     parser.add_argument(
@@ -93,7 +98,9 @@ def main(argv: list[str] | None = None) -> int:
         except ImportError as exc:
             print(f"could not load the terminal UI: {exc}\n{SETUP_HINT}", file=sys.stderr)
             return 1
-        DVDRipperApp(paths, output_dir=args.output_dir, ffmpeg=ffmpeg, ffprobe=ffprobe).run()
+        DVDRipperApp(paths, output_dir=args.output_dir, ffmpeg=ffmpeg, ffprobe=ffprobe).run(
+            mouse=not args.no_mouse
+        )
         return 0
     except (ValueError, OSError) as exc:
         print(str(exc), file=sys.stderr)

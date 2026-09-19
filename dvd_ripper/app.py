@@ -12,7 +12,7 @@ from typing import Any
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.widgets import Button, Checkbox, Footer, Input, ProgressBar, RichLog, Select, Static
+from textual.widgets import Button, Checkbox, Footer, Input, Log, ProgressBar, Select, Static
 
 from .encoder import Progress, available_output_path, encode_title, output_path
 from .ffmpeg import FFmpegError, build_encode_command, choose_english_audio
@@ -72,7 +72,7 @@ class DVDRipperApp(App[None]):
     """inspect provided discs and encode selected titles; command display is optional."""
 
     TITLE = "dvd iso ripper"
-    BINDINGS = [("q", "quit", "quit"), ("ctrl+c", "quit", "quit")]
+    BINDINGS = [("q", "quit", "quit")]
     CSS = """
     #content { height: 1fr; padding: 0 1; }
     .controls { height: auto; }
@@ -167,9 +167,9 @@ class DVDRipperApp(App[None]):
                 yield Static("waiting for scan…", markup=False)
             with Horizontal(id="command-actions"):
                 yield Button("show ffmpeg command", id="preview-button")
-            yield RichLog(id="preview", wrap=True, markup=False, highlight=False)
+            yield Log(id="preview", highlight=False)
             yield Static("", id="error", markup=False)
-            yield RichLog(id="log", wrap=True, markup=False, highlight=False, max_lines=500)
+            yield Log(id="log", highlight=False, max_lines=500)
         yield Static("ready", id="status", markup=False)
         yield ProgressBar(total=1, show_eta=False, id="progress")
         yield Button("encode", id="encode", variant="success")
@@ -190,7 +190,7 @@ class DVDRipperApp(App[None]):
         self.query_one("#status", Static).update(message)
 
     def _write_log(self, message: str) -> None:
-        self.query_one("#log", RichLog).write(Text(message))
+        self.query_one("#log", Log).write_line(message)
 
     def _clear_error(self) -> None:
         panel = self.query_one("#error", Static)
@@ -239,7 +239,7 @@ class DVDRipperApp(App[None]):
             button.disabled = self._ripper_closing or not has_titles
 
     def _invalidate_preview(self) -> None:
-        self.query_one("#preview", RichLog).clear().write(
+        self.query_one("#preview", Log).clear().write_line(
             "command display is optional; encode uses your current choices."
         )
 
@@ -331,10 +331,12 @@ class DVDRipperApp(App[None]):
         await titles.remove_children()
         self._set_status(f"scanning {path}…")
         task = asyncio.current_task()
+        reported: set[str] = set()
 
         def report(message: str) -> None:
             if self._job is task and not self._cancelling and not self._ripper_closing:
-                self._set_status(message)
+                reported.add(message)
+                self._set_status(message.split("\n", 1)[0])
                 self._write_log(message)
 
         dvd = await scan_dvd(path, ffprobe=self.ffprobe, on_progress=report)
@@ -348,14 +350,16 @@ class DVDRipperApp(App[None]):
         else:
             await titles.mount(Static("no playable titles found.", markup=False))
         for warning in dvd.warnings:
-            self._write_log(f"warning: {warning}")
+            if warning not in reported:
+                self._write_log(f"warning: {warning}")
         next_step = (
             "review titles/audio, then encode."
             if self.output_dir is not None
             else "choose an output directory, then click use directory."
         )
-        self._set_status(f"found {len(dvd.titles)} title(s). {next_step}")
-        self._write_log(f"scan complete: {len(dvd.titles)} title(s).")
+        summary = f"{len(dvd.titles)} title(s); skipped {len(dvd.warnings)} title(s)."
+        self._set_status(f"found {summary} {next_step}")
+        self._write_log(f"scan complete: {summary}")
         self.query_one("#progress", ProgressBar).update(total=1, progress=0)
 
     def on_select_changed(self, event: Select.Changed) -> None:
@@ -426,10 +430,10 @@ class DVDRipperApp(App[None]):
         ]
 
     def _show_commands(self, commands: list[list[str]]) -> None:
-        preview = self.query_one("#preview", RichLog).clear()
-        preview.write("filenames shown are estimates; collisions get numbered at completion.")
+        preview = self.query_one("#preview", Log).clear()
+        preview.write_line("filenames shown are estimates; collisions get numbered at completion.")
         for command in commands:
-            preview.write(Text(shlex.join(command)))
+            preview.write_line(shlex.join(command))
 
     def _preview(self) -> None:
         self._clear_error()
@@ -442,10 +446,11 @@ class DVDRipperApp(App[None]):
         self._set_status(
             "ffmpeg command shown. encode starts conversion; no subtitles are included."
         )
-        self.query_one("#preview", RichLog).scroll_visible()
+        self.query_one("#preview", Log).scroll_visible()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         name = event.button.id
+
         if name == "encode" and self._job is not None:
             self._request_cancel()
             return
