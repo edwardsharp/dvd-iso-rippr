@@ -39,7 +39,7 @@ dvd-ripper "movie one.iso" "movie two.img"
 
 choose a disc → confirm output → select titles/audio → **encode**. without `-o`, confirm the suggested ISO directory with **use directory** or enter, or type another path.
 
-**main/all** select titles. **show ffmpeg command** is optional. the bottom **encode** button becomes **cancel encoding** (or **cancel scan**) while working. cancelling stops the batch, removes unfinished output, and keeps completed files. **q** quits.
+**main/all** select titles. **show ffmpeg command** is optional. the bottom **encode** button becomes **cancel encoding** (or **cancel scan**) while working. cancelling stops the batch, removes unfinished output, and keeps completed files. **ctrl+c** always quits safely; **q** quits unless you're typing an output path.
 
 unreadable titles are skipped and logged; readable titles before and after them remain selectable. a scan only fails if no usable titles remain or the probe tool cannot start.
 

@@ -10,7 +10,9 @@ from pathlib import Path
 from typing import Any
 
 from rich.text import Text
+from textual import events
 from textual.app import App, ComposeResult
+from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import Button, Checkbox, Footer, Input, Log, ProgressBar, Select, Static
 
@@ -72,7 +74,10 @@ class DVDRipperApp(App[None]):
     """inspect provided discs and encode selected titles; command display is optional."""
 
     TITLE = "dvd iso ripper"
-    BINDINGS = [("q", "quit", "quit")]
+    BINDINGS = [
+        Binding("ctrl+c", "quit", "quit", priority=True),
+        Binding("q", "quit_shortcut", "quit", priority=True),
+    ]
     CSS = """
     #content { height: 1fr; padding: 0 1; }
     .controls { height: auto; }
@@ -534,6 +539,27 @@ class DVDRipperApp(App[None]):
                 self._cancelling = True
                 task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+
+    async def on_event(self, event: events.Event) -> None:
+        # dropdown type-ahead filters printable bindings, even priority bindings.
+        if (
+            isinstance(event, events.Key)
+            and not event.is_forwarded
+            and event.key == "q"
+            and not isinstance(self.focused, Input)
+        ):
+            await self.action_quit()
+            return
+        await super().on_event(event)
+
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        if action == "quit_shortcut":
+            # keep paths containing q editable; ctrl+c always takes priority.
+            return not isinstance(self.focused, Input)
+        return super().check_action(action, parameters)
+
+    async def action_quit_shortcut(self) -> None:
+        await self.action_quit()
 
     async def action_quit(self) -> None:
         self._request_cancel()

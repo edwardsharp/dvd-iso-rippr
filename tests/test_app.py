@@ -317,13 +317,9 @@ async def test_preview_is_shell_quoted_literal_and_never_encodes(backend, tmp_pa
 
 
 @pytest.mark.parametrize("selector", ["#preview", "#log"])
-async def test_scrolled_log_selection_copies_partial_text_without_quitting(
-    backend, monkeypatch, selector
-):
+async def test_scrolled_log_selection_exposes_partial_text(backend, selector):
     dvd, _, _, _ = backend
     app = DVDRipperApp([dvd.path], output_dir=dvd.path.parent)
-    copy = Mock(wraps=app.copy_to_clipboard)
-    monkeypatch.setattr(app, "copy_to_clipboard", copy)
     async with app.run_test(size=(100, 40)) as pilot:
         await idle(app, pilot)
         log = app.query_one(selector, Log)
@@ -346,15 +342,75 @@ async def test_scrolled_log_selection_copies_partial_text_without_quitting(
         app.screen.selections = {log: selection}
         await pilot.pause()
         assert app.screen.get_selected_text() == expected
-        await pilot.press("ctrl+c")
-        copy.assert_called_once_with(expected)
-        assert app.clipboard == expected
         assert app.is_running
         assert not app._ripper_closing
         assert_action(app)
 
 
-async def test_ctrl_c_keeps_input_copy_binding(backend, monkeypatch):
+@pytest.mark.parametrize("quit_key", ["ctrl+c", "q"])
+@pytest.mark.parametrize("focused", ["#disc", "#audio-2", "#log", "#encode"])
+async def test_quit_shortcuts_take_priority_over_focused_controls(backend, quit_key, focused):
+    dvd, _, _, _ = backend
+    app = DVDRipperApp([dvd.path], output_dir=dvd.path.parent)
+    async with app.run_test(size=(100, 40)) as pilot:
+        await idle(app, pilot)
+        app.query_one(focused).focus()
+        await pilot.pause()
+        assert app.focused is app.query_one(focused)
+        await pilot.press(quit_key)
+        assert app._ripper_closing
+        assert app._job is None
+
+
+@pytest.mark.parametrize("quit_key", ["ctrl+c", "q"])
+async def test_quit_shortcuts_work_with_open_dropdown(backend, quit_key):
+    dvd, _, _, _ = backend
+    app = DVDRipperApp([dvd.path], output_dir=dvd.path.parent)
+    async with app.run_test(size=(100, 40)) as pilot:
+        await idle(app, pilot)
+        select = app.query_one("#audio-2", Select)
+        select.scroll_visible(animate=False)
+        select.focus()
+        await pilot.press("enter")
+        await pilot.pause()
+        assert select.expanded
+        await pilot.press(quit_key)
+        assert app._ripper_closing
+        assert app._job is None
+
+
+async def test_q_remains_typeable_in_output_path_but_quits_after_leaving_field(backend):
+    dvd, _, _, _ = backend
+    app = DVDRipperApp([dvd.path], output_dir=dvd.path.parent)
+    async with app.run_test(size=(100, 40)) as pilot:
+        await idle(app, pilot)
+        field = app.query_one("#output-directory", Input)
+        field.focus()
+        await pilot.press("end")
+        before = field.value
+        assert app.check_action("quit_shortcut", ()) is False
+        await pilot.press("q")
+        assert field.value == before + "q"
+        assert app.is_running and not app._ripper_closing
+        app.query_one("#use-output", Button).focus()
+        await pilot.pause()
+        assert app.check_action("quit_shortcut", ()) is True
+        await pilot.press("q")
+        assert app._ripper_closing
+
+
+async def test_ctrl_c_quits_from_automatically_focused_output_prompt(backend):
+    dvd, _, _, _ = backend
+    app = DVDRipperApp([dvd.path])
+    async with app.run_test(size=(100, 40)) as pilot:
+        await idle(app, pilot)
+        assert app.focused is app.query_one("#output-directory", Input)
+        await pilot.press("ctrl+c")
+        assert app._ripper_closing
+        assert app._job is None
+
+
+async def test_ctrl_c_quits_with_input_selection_instead_of_copying(backend, monkeypatch):
     dvd, _, _, _ = backend
     app = DVDRipperApp([dvd.path], output_dir=dvd.path.parent)
     copy = Mock(wraps=app.copy_to_clipboard)
@@ -366,20 +422,16 @@ async def test_ctrl_c_keeps_input_copy_binding(backend, monkeypatch):
         field.focus()
         await pilot.pause()
         await pilot.press("home", "shift+end", "ctrl+c")
-        copy.assert_called_once_with(field.value)
-        assert app.is_running
-        assert not app._ripper_closing
+        copy.assert_not_called()
+        assert app._ripper_closing
+        assert app._job is None
 
 
-async def test_command_selection_is_complete_literal_multiline_and_invalidates(
-    backend, monkeypatch
-):
+async def test_command_selection_is_complete_literal_multiline_and_invalidates(backend):
     dvd, _, encode, build = backend
     app = DVDRipperApp(
         [dvd.path], output_dir=dvd.path.parent, ffmpeg="café's [red]tools/" + "x" * 160
     )
-    copy = Mock(wraps=app.copy_to_clipboard)
-    monkeypatch.setattr(app, "copy_to_clipboard", copy)
     async with app.run_test() as pilot:
         await idle(app, pilot)
         await click(app, pilot, "#all")
@@ -398,9 +450,7 @@ async def test_command_selection_is_complete_literal_multiline_and_invalidates(
                 Offset(0, 1), Offset(len(preview.lines[-1]), len(preview.lines) - 1)
             )
         }
-        await pilot.press("ctrl+c")
-        copy.assert_called_once_with(expected)
-        assert app.clipboard == expected
+        assert app.screen.get_selected_text() == expected
         assert "filenames shown are estimates" not in expected
         assert "café" in expected and "[red]" in expected
         assert [shlex.split(line) for line in expected.splitlines()] == commands
@@ -409,15 +459,12 @@ async def test_command_selection_is_complete_literal_multiline_and_invalidates(
         await pilot.pause()
         assert_commands_cleared(app)
         assert not list(app.query("#copy-command, #copy-log"))
-        assert copy.call_count == 1
         encode.assert_not_awaited()
 
 
-async def test_log_selection_preserves_full_bounded_lines(backend, monkeypatch):
+async def test_log_selection_preserves_full_bounded_lines(backend):
     dvd, _, _, _ = backend
     app = DVDRipperApp([dvd.path], output_dir=dvd.path.parent)
-    copy = Mock(wraps=app.copy_to_clipboard)
-    monkeypatch.setattr(app, "copy_to_clipboard", copy)
     async with app.run_test() as pilot:
         await idle(app, pilot)
         log = app.query_one("#log", Log).clear()
@@ -432,10 +479,8 @@ async def test_log_selection_preserves_full_bounded_lines(backend, monkeypatch):
                 Offset(0, 0), Offset(len(log.lines[-1]), len(log.lines) - 1)
             )
         }
-        await pilot.press("ctrl+c")
         expected = "\n".join(lines[-500:])
-        copy.assert_called_once_with(expected)
-        assert app.clipboard == expected
+        assert app.screen.get_selected_text() == expected
         assert log.lines == lines[-500:]
 
 
@@ -908,7 +953,7 @@ async def test_scan_responsive_cancel_cleanup_and_late_callback(backend):
         assert_action(app)
 
 
-async def test_encode_batch_progress_and_busy_controls(backend, tmp_path, monkeypatch):
+async def test_encode_batch_progress_and_busy_controls(backend, tmp_path):
     dvd, _, encode, _ = backend
     started = asyncio.Event()
     release = asyncio.Event()
@@ -923,9 +968,6 @@ async def test_encode_batch_progress_and_busy_controls(backend, tmp_path, monkey
 
     encode.side_effect = slow_encode
     app = DVDRipperApp([dvd.path], output_dir=tmp_path, ffmpeg="chosen-ffmpeg")
-    copy = Mock(wraps=app.copy_to_clipboard)
-    monkeypatch.setattr(app, "copy_to_clipboard", copy)
-    monkeypatch.setattr(app, "notify", Mock())
     async with app.run_test(size=(100, 40)) as pilot:
         try:
             await idle(app, pilot)
@@ -961,9 +1003,7 @@ async def test_encode_batch_progress_and_busy_controls(backend, tmp_path, monkey
                         Offset(0, first), Offset(len(log.lines[-1]), len(log.lines) - 1)
                     )
                 }
-                await pilot.press("ctrl+c")
-                copy.assert_called_with(expected)
-                assert app.clipboard == expected
+                assert app.screen.get_selected_text() == expected
                 assert app._job is task
                 assert task.cancelling() == 0 and not task.done()
                 assert not app._cancelling
@@ -975,7 +1015,6 @@ async def test_encode_batch_progress_and_busy_controls(backend, tmp_path, monkey
                     log_text(app),
                     log_text(app, "#preview"),
                 )
-            assert copy.call_count == 2
             assert encode.await_count == 1
         finally:
             release.set()
@@ -1061,7 +1100,7 @@ async def test_main_encode_action_cancels_once_stops_queue_and_keeps_completed_l
         assert (status(app), app.query_one("#progress", ProgressBar).progress) == before
 
 
-@pytest.mark.parametrize("quit_key", ["q", "ctrl+q"])
+@pytest.mark.parametrize("quit_key", ["q", "ctrl+c", "ctrl+q"])
 @pytest.mark.parametrize("job_name", ["scan", "encode"])
 async def test_quit_waits_for_backend_cleanup_and_ignores_late_callbacks(
     backend, job_name, quit_key
@@ -1095,6 +1134,12 @@ async def test_quit_waits_for_backend_cleanup_and_ignores_late_callbacks(
                 await click(app, pilot, "#encode")
             await asyncio.wait_for(started.wait(), 3)
             task = app._job
+            log = app.query_one("#log", Log)
+            app._write_log("selected text must not prevent quitting")
+            log.focus()
+            app.screen.selections = {log: Selection.from_offsets(Offset(0, 0), Offset(5, 0))}
+            await pilot.pause()
+            assert app.screen.get_selected_text()
             # do not await the key dispatch until the deliberately held cleanup can finish.
             quitting = asyncio.create_task(pilot.press(quit_key))
             await asyncio.wait_for(cleaning.wait(), 3)
